@@ -2520,6 +2520,12 @@ def main():
         .build()
     )
 
+# --- Railway HTTP keep-alive (Web Service requirement) ---
+    threading.Thread(
+        target=run_http,
+        daemon=True
+    ).start()
+
     app.add_handler(CommandHandler("start", start))
 
     app.add_handler(CommandHandler("learn", learn))
