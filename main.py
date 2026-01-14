@@ -1113,6 +1113,24 @@ def kb_multi_result_learn(letters: str, chosen: Set[str], correct: Set[str], tot
     ]
     return InlineKeyboardMarkup([row1, row2] + _build_jump_rows(total_questions_for_jump))
 
+def kb_multi_result_drill(letters: str, chosen: Set[str], correct: Set[str], show_answer: bool):
+    row1 = []
+    for k in letters:
+        if k in correct:
+            label = f"✅ {k}"
+        elif k in chosen:
+            label = f"❌ {k}"
+        else:
+            label = k
+        row1.append(InlineKeyboardButton(label, callback_data="noop"))
+
+    row2 = [
+        InlineKeyboardButton("✅ Ответ" if not show_answer else "✅ Скрыть", callback_data="toggle_answer"),
+        InlineKeyboardButton("➡️ Следующий", callback_data="next"),
+    ]
+    return InlineKeyboardMarkup([row1, row2])
+
+
 
 # =========================================================
 # EXAM POOL + SCORE
@@ -1236,6 +1254,30 @@ def _mode_question_header(context: ContextTypes.DEFAULT_TYPE, q: dict) -> str:
 
     return ""
 
+
+async def _edit_only_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_markup: InlineKeyboardMarkup):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    chat_id = _chat_id_from_update(update)
+    if chat_id is None:
+        return
+    msg_id = query.message.message_id
+
+    try:
+        await tg_retry(
+            lambda: context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=reply_markup
+            ),
+            label="edit_only_keyboard"
+        )
+    except BadRequest as e:
+        # "Message is not modified" и похожее
+        if "not modified" in str(e).lower():
+            return
+        raise
 
 async def _send_or_edit_question_message(
     update: Update,
@@ -1398,7 +1440,6 @@ async def show_current(
     chat_id = _chat_id_from_update(update)
 
     if not mode or not q or chat_id is None:
-        # мягко сообщаем в чат, если можем
         try:
             if update.callback_query and update.callback_query.message:
                 await tg_retry(
@@ -1421,7 +1462,7 @@ async def show_current(
     reveal = None
     if mode == "drill":
         reveal = context.user_data.get("drill_reveal")
-    if mode == "learn":
+    elif mode == "learn":
         reveal = context.user_data.get("learn_reveal")
 
     selected = set(context.user_data.get("multi_sel") or [])
@@ -1444,11 +1485,12 @@ async def show_current(
     text = (prefix + header + multi_hint + body).strip()
     image_file_id = await get_image_file_id_if_any_async(q)
 
-    log.info("IMG decide qid=%s media=%s file_id=%s text_len=%d",
-             q.get("id"), q.get("media"), image_file_id, len(text))
+    log.info(
+        "IMG decide qid=%s media=%s file_id=%s text_len=%d",
+        q.get("id"), q.get("media"), image_file_id, len(text)
+    )
 
-    # Если картинка есть, но caption слишком длинный — делаем стек:
-    # [картинка] -> [вопрос] -> [якоря]
+    # ----- image handling -----
     if image_file_id and len(text) > CAPTION_SAFE_LIMIT:
         await _clear_screens(context, chat_id)
         await _upsert_image_message_above(update, context, file_id=image_file_id)
@@ -1458,21 +1500,25 @@ async def show_current(
             await _delete_image_if_any(context, chat_id)
         image_for_screen = image_file_id
 
-    # totals
+    # ----- totals -----
     if mode == "learn":
-        total_for_jump = _learn_total_for_jump(context)   # 0 в trial
+        total_for_jump = _learn_total_for_jump(context)
     else:
         total_for_jump = len(QUESTIONS) if QUESTIONS else 0
 
-    # markup
+    # ----- keyboard -----
     if mode == "learn":
         trial = bool(context.user_data.get("trial"))
         if is_multi:
             if context.user_data.get("multi_locked", False) and reveal_set:
                 correct = q_correct_set(q)
-                markup = kb_multi_result_learn(letters, reveal_set, correct, total_for_jump, trial=trial)
+                markup = kb_multi_result_learn(
+                    letters, reveal_set, correct, total_for_jump, trial=trial
+                )
             else:
-                markup = kb_multi_learn(letters, selected, total_for_jump, trial=trial)
+                markup = kb_multi_learn(
+                    letters, selected, total_for_jump, trial=trial
+                )
         else:
             markup = kb_learn(letters, total_for_jump, trial=trial)
 
@@ -1488,6 +1534,17 @@ async def show_current(
         else:
             markup = kb_exam(letters)
 
+    # =====================================================
+    # АНКОРЫ: СНАЧАЛА ЯКОРЯ, ПОТОМ ВОПРОС (ФОКУС НА ВОПРОСЕ)
+    # =====================================================
+    if mode == "learn" and send_anchors:
+        await _upsert_anchors_message_below(update, context, q)
+    else:
+        await _delete_anchors_if_any(context, chat_id)
+
+    # =====================================================
+    # ВОПРОС (ПОСЛЕДНИМ СООБЩЕНИЕМ)
+    # =====================================================
     await _send_or_edit_question_message(
         update,
         context,
@@ -1495,11 +1552,6 @@ async def show_current(
         reply_markup=markup,
         image_file_id=image_for_screen,
     )
-
-    if mode == "learn" and send_anchors:
-        await _upsert_anchors_message_below(update, context, q)
-    elif mode != "learn":
-        await _delete_anchors_if_any(context, chat_id)
 
 
 # =========================================================
@@ -2248,11 +2300,37 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _advance_exam(update, context)
             return
 
+        # learn: результат показываем только в клавиатуре, без перерисовки текста (без прыжка)
         if mode == "learn":
-            await show_current(update, context, send_anchors=True)
-        else:
-            await show_current(update, context, prefix="<b>Интенсив</b>\n\n")
-        return
+            letters_now = get_letters(q)
+            correct = q_correct_set(q)
+            total_for_jump = _learn_total_for_jump(context)
+            trial = bool(context.user_data.get("trial"))
+
+            markup = kb_multi_result_learn(
+                letters_now,
+                sel,
+                correct,
+                total_for_jump,
+                trial=trial
+            )
+            await _edit_only_keyboard(update, context, markup)
+            return
+
+        # drill: тоже только клавиатура
+        if mode == "drill":
+            letters_now = get_letters(q)
+            correct = q_correct_set(q)
+            show_answer = bool(context.user_data.get("show_answer", False))
+
+            markup = kb_multi_result_drill(
+                letters_now,
+                sel,
+                correct,
+                show_answer
+            )
+            await _edit_only_keyboard(update, context, markup)
+            return
 
     if data == "next":
         await ensure_loaded_async()
