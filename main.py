@@ -400,6 +400,49 @@ def get_sheets_service():
     _SHEETS_SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
     return _SHEETS_SERVICE
 
+USER_LOGS_SHEET = os.environ.get("USER_LOGS_SHEET", "user_logs")
+
+
+def log_user_event_sync(*, user, event: str, mode: str):
+    """
+    event: 'visit' | 'mode'
+    mode: 'start' | 'learn' | 'drill' | 'exam'
+    """
+    try:
+        service = get_sheets_service()
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        row = [
+            str(user.id),
+            user.username or "",
+            user.first_name or "",
+            event,
+            mode,
+            ts,
+        ]
+
+        req = service.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range=f"{USER_LOGS_SHEET}!A:F",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        )
+        gs_execute(req)
+    except Exception as e:
+        log.warning("user_log failed: %r", e)
+
+
+async def log_user_event(context: ContextTypes.DEFAULT_TYPE, *, user, event: str, mode: str):
+    try:
+        await to_thread_timeout(
+            lambda: log_user_event_sync(user=user, event=event, mode=mode),
+            timeout=8,
+            label="user_log.thread"
+        )
+    except Exception:
+        pass
+
 
 def gs_execute(req, tries: int = 7, base_sleep: float = 1.0):
     last_exc = None
@@ -1633,6 +1676,16 @@ async def _setup_trial_if_needed(update: Update, context: ContextTypes.DEFAULT_T
 # =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # логируем visit один раз за сессию
+    if not context.user_data.get("_visit_logged"):
+        context.user_data["_visit_logged"] = True
+        await log_user_event(
+            context,
+            user=update.effective_user,
+            event="visit",
+            mode="start"
+        )
+
     await tg_retry(
         lambda: update.message.reply_text(
             "👋 Вас приветствует тренажёр подготовки к письменному экзамену на водительские права в Корее.\n\n"
@@ -1654,6 +1707,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # логируем visit (если человек сразу зашел в /learn)
+    if not context.user_data.get("_visit_logged"):
+        context.user_data["_visit_logged"] = True
+        await log_user_event(
+            context,
+            user=update.effective_user,
+            event="visit",
+            mode="learn"
+        )
+
+    # логируем вход в режим learn (без дублей)
+    if context.user_data.get("_last_mode") != "learn":
+        context.user_data["_last_mode"] = "learn"
+        await log_user_event(
+            context,
+            user=update.effective_user,
+            event="mode",
+            mode="learn"
+        )
+
     await ensure_loaded_async()
     if not QUESTIONS:
         await tg_retry(lambda: update.message.reply_text("База вопросов пустая."))
@@ -1722,6 +1795,26 @@ async def learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def drill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # логируем visit (если человек сразу зашел в /drill)
+    if not context.user_data.get("_visit_logged"):
+        context.user_data["_visit_logged"] = True
+        await log_user_event(
+            context,
+            user=update.effective_user,
+            event="visit",
+            mode="drill"
+        )
+
+    # логируем вход в режим drill (без дублей)
+    if context.user_data.get("_last_mode") != "drill":
+        context.user_data["_last_mode"] = "drill"
+        await log_user_event(
+            context,
+            user=update.effective_user,
+            event="mode",
+            mode="drill"
+        )
+
     # если нет подписки — запрещаем
     def _paid():
         return get_license_mgr().is_active(update.effective_user.id)
@@ -1772,10 +1865,31 @@ async def drill(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "_screen": None,
         "_anchors": None,
     })
+
     await show_current(update, context, prefix="<b>Интенсив</b>\n\n", send_anchors=False)
 
 
 async def exam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # логируем visit (если человек сразу зашел в /exam)
+    if not context.user_data.get("_visit_logged"):
+        context.user_data["_visit_logged"] = True
+        await log_user_event(
+            context,
+            user=update.effective_user,
+            event="visit",
+            mode="exam"
+        )
+
+    # логируем вход в режим exam (без дублей)
+    if context.user_data.get("_last_mode") != "exam":
+        context.user_data["_last_mode"] = "exam"
+        await log_user_event(
+            context,
+            user=update.effective_user,
+            event="mode",
+            mode="exam"
+        )
+
     await ensure_loaded_async()
     if not QUESTIONS:
         await tg_retry(lambda: update.message.reply_text("База вопросов пустая."))
