@@ -980,6 +980,20 @@ async def _upsert_anchors_message_below(update: Update, context: ContextTypes.DE
 # KEYBOARDS
 # =========================================================
 
+async def _edit_only_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_markup):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=query.message.chat_id,
+            message_id=query.message.message_id,
+            reply_markup=reply_markup
+        )
+    except Exception:
+        pass
+
+
 def _build_jump_rows(total_questions: int):
     rows = []
     if total_questions <= 0:
@@ -2186,12 +2200,28 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["multi_sel"] = list(sel)
         context.user_data["multi_sel_order"] = order
 
+        # 👉 ВАЖНО: пересобираем ТОЛЬКО клавиатуру
+        letters_str = get_letters(q)
+        selected = set(context.user_data.get("multi_sel") or [])
+
         if mode == "learn":
-            await show_current(update, context, send_anchors=True)
+            trial = bool(context.user_data.get("trial"))
+            markup = kb_multi_learn(
+                letters_str,
+                selected,
+                _learn_total_for_jump(context),
+                trial=trial
+            )
         elif mode == "drill":
-            await show_current(update, context, prefix="<b>Интенсив</b>\n\n")
-        else:
-            await show_current(update, context)
+            markup = kb_multi_drill(
+                letters_str,
+                selected,
+                bool(context.user_data.get("show_answer", False))
+            )
+        else:  # exam
+            markup = kb_multi_exam(letters_str, selected)
+
+        await _edit_only_keyboard(update, context, markup)
         return
 
     if data == "done":
